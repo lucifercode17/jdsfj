@@ -4,6 +4,9 @@ from datetime import date
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
+import asyncio
+import time
+from datetime import date, timedelta
 
 from app.exelon import fetch_actual_wind, fetch_wind_forecasts
 from app.analytics import (
@@ -29,6 +32,11 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+# In-memory cache for forecast accuracy results
+CACHE_TTL_SECONDS = 60 * 30# 30 mins 
+
+accuracy_cache = {}
+accuracy_cache_lock = asyncio.Lock()
 
 
 @app.get("/")
@@ -87,6 +95,7 @@ async def wind_forecasts(
         ) from exc
 
 
+
 @app.get("/api/wind/accuracy")
 async def wind_accuracy(
     start: date = Query(default=date(2026, 1, 1)),
@@ -98,47 +107,68 @@ async def wind_accuracy(
             detail="end must be on or after start",
         )
 
-    try:
-        # Fetch an additional day so January 1 delivery intervals
-        # can use forecasts published on December 31.
-        from datetime import timedelta
+    cache_key = (start, end)
+    now = time.monotonic()
 
-        actual_records = await fetch_actual_wind(start, end)
-        forecast_records = await fetch_wind_forecasts(
-            start - timedelta(days=1), end
-        )
+    # Return cached data when it is still valid.
+    cached = accuracy_cache.get(cache_key)
+    if cached and now < cached["expires_at"]:
+        return cached["data"]
 
-        actuals = prepare_actuals(actual_records)
-        forecasts = prepare_forecasts(forecast_records)
-        matched = match_day_ahead_forecasts(actuals, forecasts)
-        metrics = calculate_metrics(matched)
+    # Prevent simultaneous requests from fetching the same data repeatedly.
+    async with accuracy_cache_lock:
+        now = time.monotonic()
+        cached = accuracy_cache.get(cache_key)
 
-        return {
-            "period": {
-                "start": start.isoformat(),
-                "end": end.isoformat(),
-            },
-            "forecast_selection": (
-                "Latest forecast published before delivery day starts"
-            ),
-            "metrics": metrics,
-            "data": [
-                {
-                    "startTime": row.startTime.isoformat(),
-                    "publishTime": row.publishTime.isoformat(),
-                    "actual_mw": round(float(row.actual_mw), 2),
-                    "forecast_mw": round(float(row.forecast_mw), 2),
-                    "error_mw": round(float(row.error_mw), 2),
-                }
-                for row in matched.itertuples(index=False)
-            ],
-        }
+        if cached and now < cached["expires_at"]:
+            return cached["data"]
 
-    except (httpx.HTTPError, ValueError) as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not calculate forecast accuracy: {exc}",
-        ) from exc
+        try:
+            actual_records = await fetch_actual_wind(start, end)
+
+            forecast_records = await fetch_wind_forecasts(
+                start - timedelta(days=1), end
+            )
+
+            actuals = prepare_actuals(actual_records)
+            forecasts = prepare_forecasts(forecast_records)
+
+            matched = match_day_ahead_forecasts(actuals, forecasts)
+            metrics = calculate_metrics(matched)
+
+            result = {
+                "period": {
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                },
+                "forecast_selection": (
+                    "Latest forecast published before delivery day starts"
+                ),
+                "metrics": metrics,
+                "data": [
+                    {
+                        "startTime": row.startTime.isoformat(),
+                        "publishTime": row.publishTime.isoformat(),
+                        "actual_mw": round(float(row.actual_mw), 2),
+                        "forecast_mw": round(float(row.forecast_mw), 2),
+                        "error_mw": round(float(row.error_mw), 2),
+                    }
+                    for row in matched.itertuples(index=False)
+                ],
+            }
+
+            accuracy_cache[cache_key] = {
+                "expires_at": time.monotonic() + CACHE_TTL_SECONDS,
+                "data": result,
+            }
+
+            return result
+
+        except (httpx.HTTPError, ValueError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not calculate forecast accuracy: {exc}",
+            ) from exc
 
 @app.get("/api/debug/wind")
 async def debug_wind_data():
